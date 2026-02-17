@@ -2,16 +2,20 @@ import streamlit as st
 import google.generativeai as genai
 import requests
 import time
+import numpy as np
 from typing import List, Dict
+from sklearn.metrics.pairwise import cosine_similarity
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="MediTrial AI | Clinical Trials Assistant",
+    page_title="MediTrial AI | Global Assistant",
     page_icon="🧬",
     layout="wide"
 )
 
 # Initialize Session State
+if "history_vectors" not in st.session_state:
+    st.session_state.history_vectors = [] 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "image_analysis_context" not in st.session_state:
@@ -19,8 +23,8 @@ if "image_analysis_context" not in st.session_state:
 
 # --- SIDEBAR & SETUP ---
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/3004/3004458.png", width=100)
-    st.title("MediTrial AI")
+    st.image("https://cdn-icons-png.flaticon.com/512/3004/3004458.png", width=80)
+    st.title("MediTrial AI 2.0")
     
     # 1. API Key Handling
     api_key = None
@@ -28,319 +32,266 @@ with st.sidebar:
         secret_key = st.secrets["GOOGLE_API_KEY"]
         if "YOUR_API_KEY" not in secret_key:
             api_key = secret_key
-            st.success("✅ API Key loaded from secrets")
-        else:
-            st.error("⚠️ Invalid Key in secrets.toml")
+            st.success("✅ Key loaded")
     
     if not api_key:
-        api_key = st.text_input("Enter Google Gemini API Key", type="password")
+        api_key = st.text_input("Gemini API Key", type="password")
     
+    # --- DEBUGGER (Hidden by default) ---
+    if api_key:
+        valid_model_names = []
+        try:
+            genai.configure(api_key=api_key)
+            # Simple check to find working models
+            all_models = genai.list_models()
+            for m in all_models:
+                if 'generateContent' in m.supported_generation_methods:
+                    valid_model_names.append(m.name)
+        except:
+            valid_model_names = ["models/gemini-1.5-flash"]
+            
     st.markdown("---")
     
-    # Persona Selection
+    # 2. Language Selection
+    selected_language = st.selectbox(
+        "🗣️ Language / 语言 / भाषा",
+        ["English", "Tamil", "Spanish", "French", "Hindi", "Chinese (Simplified)", "Arabic", "German"],
+        index=0
+    )
+    
+    # 3. Persona Selection
     user_persona = st.radio(
         "I am a:",
         ("Patient / Caregiver", "Doctor / Researcher"),
         index=0
     )
     
-    # Advanced Filters
-    st.markdown("### 🔍 Search Filters")
-    status_filter = st.multiselect(
-        "Recruitment Status",
-        ["RECRUITING", "NOT_YET_RECRUITING", "ACTIVE_NOT_RECRUITING", "COMPLETED"],
-        default=["RECRUITING"]
-    )
-    
-    # Reduced max results to save tokens on free tier
-    max_results = st.slider("Max Studies to Analyze", 3, 15, 5)
-    
     st.markdown("---")
+    st.caption("Advanced RAG & Multimodal Enabled")
 
-# --- HELPER: ROBUST GEMINI CALLER WITH RETRY ---
-def call_gemini_safe(prompt, api_key, image=None):
-    """
-    1. Dynamically finds available models to avoid 404 errors.
-    2. Prioritizes stable models (Flash > Pro).
-    3. Implements exponential backoff for 429 (Rate Limit) errors.
-    """
+# --- HELPER: ROBUST GEMINI CALLER ---
+def get_working_model(api_key):
+    """Finds the best available model to avoid 404s."""
     genai.configure(api_key=api_key)
-    
-    # 1. DYNAMICALLY FIND VALID MODELS
-    available_models = []
     try:
-        all_models = genai.list_models()
-        for m in all_models:
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-    except Exception:
+        models = genai.list_models()
+        available = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # Priority: Flash > Pro
+        for m in available:
+            if "flash" in m and "1.5" in m: return m
+        for m in available:
+            if "pro" in m and "1.5" in m: return m
+        if available: return available[0]
+    except:
         pass
+    return "models/gemini-1.5-flash"
 
-    preferences = [
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-latest',
-        'gemini-1.5-flash-001',
-        'gemini-1.5-pro',
-        'gemini-1.5-pro-latest',
-        'gemini-pro'
-    ]
-    
-    models_to_try = []
-    
-    if available_models:
-        for pref in preferences:
-            for avail in available_models:
-                if pref in avail and avail not in models_to_try:
-                    models_to_try.append(avail)
-        if not models_to_try:
-            models_to_try = available_models
-    else:
-        models_to_try = preferences
-
-    last_error = None
-    
-    # 2. ATTEMPT GENERATION
-    for model_name in models_to_try:
+def call_gemini_safe(prompt, api_key, image=None):
+    model_name = get_working_model(api_key)
+    try:
         model = genai.GenerativeModel(model_name)
-        for attempt in range(3):
-            try:
-                if image:
-                    return model.generate_content([prompt, image]).text
-                else:
-                    return model.generate_content(prompt).text
-            except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "quota" in error_str.lower():
-                    time.sleep((attempt + 1) * 2)
-                    continue 
-                if "404" in error_str:
-                    break 
-                return f"AI Error: {error_str}"
-                
-    return f"Service Unavailable. Please wait a minute and try again. (Details: {last_error})"
+        if image:
+            return model.generate_content([prompt, image]).text
+        else:
+            return model.generate_content(prompt).text
+    except Exception as e:
+        return f"AI Error: {str(e)}"
+
+# --- RAG ENGINE (MEMORY) ---
+def get_embedding(text: str, api_key: str) -> np.ndarray:
+    genai.configure(api_key=api_key)
+    try:
+        result = genai.embed_content(
+            model="models/text-embedding-004",
+            content=text,
+            task_type="retrieval_document",
+            title="Conversation History"
+        )
+        return np.array(result['embedding'])
+    except:
+        return np.zeros(768)
+
+def retrieve_relevant_history(query: str, api_key: str, k: int = 3) -> str:
+    if not st.session_state.history_vectors: return ""
+    query_vec = get_embedding(query, api_key).reshape(1, -1)
+    if np.all(query_vec == 0): return ""
+    
+    stored_vecs = np.array([item[0] for item in st.session_state.history_vectors])
+    stored_texts = [item[1] for item in st.session_state.history_vectors]
+    
+    try:
+        similarities = cosine_similarity(query_vec, stored_vecs)[0]
+        top_k_indices = similarities.argsort()[-k:][::-1]
+        
+        retrieved = "### PAST CONVERSATION:\n"
+        found = False
+        for idx in top_k_indices:
+            if similarities[idx] > 0.45:
+                retrieved += f"- {stored_texts[idx]}\n"
+                found = True
+        return retrieved if found else ""
+    except:
+        return ""
+
+def store_interaction(user_text: str, ai_text: str, api_key: str):
+    u_vec = get_embedding(user_text, api_key)
+    st.session_state.history_vectors.append((u_vec, f"User: {user_text}", "user"))
+    a_vec = get_embedding(ai_text, api_key)
+    st.session_state.history_vectors.append((a_vec, f"AI: {ai_text}", "ai"))
 
 # --- BACKEND FUNCTIONS ---
 
-def extract_search_keywords(user_query: str, api_key: str) -> str:
-    prompt = f"""
-    Extract the 2-3 most important medical search terms from this query for a clinical trial database search.
-    User Query: "{user_query}"
-    Return ONLY the terms separated by spaces. Do not add quotes, labels, or explanations. 
-    If the query is already a keyword (e.g. "Diabetes"), just return it.
-    """
-    try:
-        result = call_gemini_safe(prompt, api_key)
-        if "Error" in result or "Unavailable" in result:
-            return user_query 
-        return result.strip()
-    except:
-        return user_query
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_clinical_trials(query: str, status: List[str], limit: int = 10) -> Dict:
+@st.cache_data(ttl=3600)
+def get_clinical_trials(query: str, status: str = "RECRUITING") -> Dict:
+    # Adding "treatment" to query helps find process-related studies
+    if "treatment" not in query.lower():
+        query += " treatment"
+        
     base_url = "https://clinicaltrials.gov/api/v2/studies"
-    status_str = ",".join(status) if status else "RECRUITING"
-    
-    params = {
-        "query.term": query,
-        "filter.overallStatus": status_str,
-        "pageSize": limit
-    }
-    
-    headers = {
-        "User-Agent": "MediTrial-AI-Student-Project/1.0 (Educational Purpose)"
-    }
-    
+    params = {"query.term": query, "filter.overallStatus": status, "pageSize": 5}
     try:
-        response = requests.get(base_url, params=params, headers=headers, timeout=20)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        return {"error": f"API Error: {str(e)}"}
+        r = requests.get(base_url, params=params, timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
-def format_trials_for_llm(trials_data: Dict) -> str:
-    if "error" in trials_data:
-        return f"System Error: {trials_data['error']}"
-    
+def format_trials(trials_data: Dict, include_links: bool) -> str:
+    """
+    Formats trials differently based on Persona.
+    include_links=True (Doctors) -> Shows IDs and Links
+    include_links=False (Patients) -> Hides technical IDs, focuses on Title/Desc
+    """
     studies = trials_data.get("studies", [])
-    if not studies:
-        return "No clinical trials found matching the criteria."
+    if not studies: return "No specific clinical trials found. (Answer based on general medical knowledge)."
     
-    context_text = "Here are the retrieved clinical trials:\n\n"
-    
-    for study in studies:
-        protocol = study.get("protocolSection", {})
-        id_module = protocol.get("identificationModule", {})
+    text = ""
+    for s in studies:
+        p = s.get("protocolSection", {})
+        id_mod = p.get("identificationModule", {})
+        nct_id = id_mod.get('nctId', 'N/A')
+        title = id_mod.get('briefTitle', 'No Title')
         
-        nct_id = id_module.get("nctId", "N/A")
-        title = id_module.get("briefTitle", "No Title")
+        if include_links:
+            # DOCTOR FORMAT: Technical, Linked
+            link = f"[{nct_id}](https://clinicaltrials.gov/study/{nct_id})"
+            text += f"ID: {link} | Title: {title}\n"
+            
+            # Add detailed eligibility
+            eligibility = p.get("eligibilityModule", {})
+            criteria = eligibility.get("eligibilityCriteria", "")[:200] + "..."
+            text += f"   Criteria Snippet: {criteria}\n"
+        else:
+            # PATIENT FORMAT: Narrative, No IDs
+            text += f"• Potential Treatment Option: {title}\n"
+            
+            # Simplify eligibility for patient context
+            eligibility = p.get("eligibilityModule", {})
+            min_age = eligibility.get("minimumAge", "N/A")
+            max_age = eligibility.get("maximumAge", "N/A")
+            text += f"   (Available for ages {min_age} to {max_age})\n"
+            
+        text += "\n"
         
-        conditions = protocol.get("conditionsModule", {}).get("conditions", [])
-        conditions_str = ", ".join(conditions) if conditions else "Not specified"
-        
-        eligibility = protocol.get("eligibilityModule", {})
-        gender = eligibility.get("sex", "All")
-        min_age = eligibility.get("minimumAge", "N/A")
-        max_age = eligibility.get("maximumAge", "N/A")
-        
-        criteria = eligibility.get("eligibilityCriteria", "Not specified")
-        criteria_snippet = criteria[:600].replace("\n", " ") + "..." if len(criteria) > 600 else criteria
-        
-        context_text += f"--- STUDY ID: {nct_id} ---\n"
-        context_text += f"Title: {title}\n"
-        context_text += f"Conditions: {conditions_str}\n"
-        context_text += f"Eligibility: Sex: {gender}, Age: {min_age}-{max_age}\n"
-        context_text += f"Criteria Snippet: {criteria_snippet}\n\n"
-        
-    return context_text
+    return text
 
-def generate_response(messages, context, persona, api_key, image_context=""):
-    # Enhanced Prompt Engineering
+def generate_response_multilingual(query, context, persona, language, memory, api_key):
+    # DYNAMIC PROMPTING
+    
     if "Doctor" in persona:
-        system_instruction = (
-            "You are an expert Clinical Research Assistant helping a doctor. "
-            "Use precise medical terminology. Focus on inclusion/exclusion criteria. "
-            "CRITICAL: When mentioning a study, ALWAYS format the NCT ID as a clickable Markdown link "
-            "like this: [NCT12345](https://clinicaltrials.gov/study/NCT12345)."
-        )
+        role_desc = "Expert Clinical Research Associate."
+        tone = "Professional, precise, technical."
+        link_instruction = "ALWAYS include clickable NCT ID links for studies."
+        goal = "Summarize the recruitment status and protocol design."
     else:
-        # PATIENT PERSONA - UPDATED: Soothing tone, Procedure focused, NO LINKS
-        system_instruction = (
-            "You are a compassionate, soothing, and reassuring Medical Guide that also acts as a caregiver for a patient. "
-            "Your goal is to reduce anxiety. "
-            "1. Explain the medical procedures or treatments mentioned in simple, comforting terms. "
-            "2. Explain how they should prepare for such treatments (mental or physical preparation). "
-            "3. Use a very calm and supportive tone. "
-            "4. Do NOT provide clickable links or NCT IDs. Just describe the options as 'available treatment studies'. "
-            "5. Generate the response as a brief summary of above points for about 20 lines like how a friend would speak."
-        )
+        role_desc = "Compassionate Medical Caregiver."
+        tone = "Warm, soothing, simple, hopeful."
+        link_instruction = "DO NOT show NCT IDs or links. Focus on the 'Treatment Process' and how it helps."
+        goal = "Explain the treatment journey step-by-step to reduce anxiety."
 
     prompt = f"""
-    System Instruction: {system_instruction}
+    ROLE: {role_desc}
+    TONE: {tone}
+    TARGET LANGUAGE: {language} (Force output in this language).
     
-    Additional Context from Patient's Image/Report:
-    {image_context}
+    USER QUERY: {query}
     
-    Context Data (Retrieved Clinical Trials):
+    CONTEXT (Clinical Data):
     {context}
     
-    User Query: {messages[-1]['content']}
+    MEMORY (Previous Chat):
+    {memory}
     
-    Answer the user's query strictly based on the provided Context Data.
+    INSTRUCTIONS:
+    1. {goal}
+    2. {link_instruction}
+    3. If the user asks for a specific language in the text (e.g., "in Tamil"), IGNORE the system setting and answer in the requested language.
+    4. If the data lists a study, explain it as a "Treatment Option" rather than a "database record".
+    5. Be culturally sensitive and supportive.
     """
-    
     return call_gemini_safe(prompt, api_key)
 
-# --- MAIN UI LAYOUT ---
+# --- UI LAYOUT ---
 
-st.header("🧬 MediTrial AI: Clinical Trial Finder")
-st.markdown(f"**Current Mode:** `{user_persona}`")
+st.header(f"🧬 MediTrial AI ({selected_language})")
 
-# 1. Image Upload Section (Multimodal)
-with st.expander("📸 Upload Medical Report / Prescription (Optional)", expanded=False):
-    uploaded_file = st.file_uploader("Upload an image to auto-find trials", type=["jpg", "png", "jpeg"])
-
+# 1. Multimodal Input
+with st.expander("📸 Upload Report / Scan", expanded=False):
+    uploaded_file = st.file_uploader("Upload Medical Record", type=["jpg", "png"])
     if uploaded_file and api_key:
         from PIL import Image
         image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Medical Record", width=250)
-        
-        if st.button("Analyze Image & Find Trials"):
-            with st.spinner("Analyzing image... (This might take a few seconds)"):
-                # UPDATED PROMPT: Extract terms AND get a soothing analysis
-                extraction_prompt = (
-                    "Analyze this medical image. Return the output in this EXACT format:\n"
-                    "TERMS: term1, term2, term3\n"
-                    "ANALYSIS: [Provide a brief, soothing explanation of the condition found in the image and general advice]"
-                )
-                
-                analysis_result = call_gemini_safe(extraction_prompt, api_key, image)
-                
-                # Check for error
-                if "Error" in analysis_result or "Unavailable" in analysis_result:
-                    st.error("Could not analyze image. Please try typing your query instead.")
-                else:
-                    # Simple parsing to separate Terms from Analysis
-                    try:
-                        if "TERMS:" in analysis_result and "ANALYSIS:" in analysis_result:
-                            parts = analysis_result.split("ANALYSIS:")
-                            extracted_terms = parts[0].replace("TERMS:", "").strip()
-                            image_analysis_text = parts[1].strip()
-                        else:
-                            extracted_terms = analysis_result
-                            image_analysis_text = "No detailed analysis available."
-                    except:
-                        extracted_terms = analysis_result
-                        image_analysis_text = ""
-
-                    st.success(f"Extracted Terms: {extracted_terms}")
-                    
-                    # Store image context in session state for later use
-                    st.session_state.image_analysis_context = image_analysis_text
-                    
-                    # Add to chat history
-                    st.session_state.messages.append({"role": "user", "content": f"Find trials for: {extracted_terms}. (Reference Image Analysis: {image_analysis_text})"})
-                    
-                    with st.spinner("Fetching trials..."):
-                        trials_data = get_clinical_trials(extracted_terms, status_filter, max_results)
-                        context = format_trials_for_llm(trials_data)
-                        
-                        # Pass the image analysis to the final generator
-                        ai_response = generate_response(
-                            st.session_state.messages, 
-                            context, 
-                            user_persona, 
-                            api_key, 
-                            image_context=image_analysis_text
-                        )
-                        st.session_state.messages.append({"role": "assistant", "content": ai_response})
-                        st.rerun()
+        st.image(image, width=200)
+        if st.button("Analyze Image"):
+            with st.spinner("Analyzing..."):
+                img_prompt = f"Analyze this image. Identify the condition. Explain it simply in {selected_language}."
+                res = call_gemini_safe(img_prompt, api_key, image)
+                st.session_state.image_analysis_context = res
+                st.info(res)
 
 # 2. Chat Interface
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# 3. User Input Handling
-if prompt := st.chat_input("Ask about a condition (e.g., 'Breast Cancer trials in Phase 3')"):
+# 3. Logic Loop
+if prompt := st.chat_input(f"Ask about treatments in {selected_language}..."):
     if not api_key:
-        st.error("Please enter your Gemini API Key in the sidebar.")
-    else:
-        # User message
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        st.error("🔑 API Key required!")
+        st.stop()
 
-        # Assistant Response
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            with st.spinner("Connecting to ClinicalTrials.gov..."):
-                
-                # Step A: Keyword Extraction
-                search_term = extract_search_keywords(prompt, api_key)
-                if search_term and search_term.lower() not in prompt.lower() and "Unavailable" not in search_term:
-                    st.caption(f"🔎 *Refined Search Term: {search_term}*")
-                
-                # Step B: API Search
-                trials_data = get_clinical_trials(search_term, status_filter, max_results)
-                
-                if "error" in trials_data:
-                    st.error(f"❌ Database Error: {trials_data['error']}")
-                    full_response = "I couldn't access the database. Please see the error above."
-                else:
-                    # Step C: RAG Contextualization
-                    context = format_trials_for_llm(trials_data)
-                    
-                    # Step D: Final Generation (Include image context if it exists from previous turn)
-                    full_response = generate_response(
-                        st.session_state.messages, 
-                        context, 
-                        user_persona, 
-                        api_key,
-                        image_context=st.session_state.image_analysis_context
-                    )
-                
-                message_placeholder.markdown(full_response)
-        
-        # Save to history
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("🧠 Analyzing treatment options..."):
+            
+            # 1. Memory
+            relevant_memory = retrieve_relevant_history(prompt, api_key)
+            
+            # 2. Search Logic
+            search_query = prompt
+            if "image" in prompt.lower() and st.session_state.image_analysis_context:
+                search_query = st.session_state.image_analysis_context[:50] # Use start of analysis as query
+
+            # 3. Fetch & Format Data
+            trials = get_clinical_trials(search_query)
+            
+            # CRITICAL: Pass persona to formatter to strip links for patients
+            include_links_flag = True if "Doctor" in user_persona else False
+            context_data = format_trials(trials, include_links=include_links_flag)
+            
+            # 4. Generate Response
+            response = generate_response_multilingual(
+                prompt, 
+                context_data, 
+                user_persona, 
+                selected_language, 
+                relevant_memory, 
+                api_key
+            )
+            
+            st.markdown(response)
+            store_interaction(prompt, response, api_key)
+            st.session_state.messages.append({"role": "assistant", "content": response})
