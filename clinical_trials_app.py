@@ -32,25 +32,9 @@ with st.sidebar:
         secret_key = st.secrets["GOOGLE_API_KEY"]
         if "YOUR_API_KEY" not in secret_key:
             api_key = secret_key
-            st.success("✅ Key loaded")
     
     if not api_key:
         api_key = st.text_input("Gemini API Key", type="password")
-    
-    # --- DEBUGGER (Hidden by default) ---
-    if api_key:
-        valid_model_names = []
-        try:
-            genai.configure(api_key=api_key)
-            # Simple check to find working models
-            all_models = genai.list_models()
-            for m in all_models:
-                if 'generateContent' in m.supported_generation_methods:
-                    valid_model_names.append(m.name)
-        except:
-            valid_model_names = ["models/gemini-1.5-flash"]
-            
-    st.markdown("---")
     
     # 2. Language Selection
     selected_language = st.selectbox(
@@ -67,7 +51,6 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.caption("Advanced RAG & Multimodal Enabled")
 
 # --- HELPER: ROBUST GEMINI CALLER ---
 def get_working_model(api_key):
@@ -97,6 +80,40 @@ def call_gemini_safe(prompt, api_key, image=None):
             return model.generate_content(prompt).text
     except Exception as e:
         return f"AI Error: {str(e)}"
+
+def transcribe_audio_with_gemini(audio_file, api_key):
+    """
+    Uses Gemini to transcribe audio bytes directly.
+    """
+    model_name = get_working_model(api_key)
+    genai.configure(api_key=api_key)
+    
+    try:
+        model = genai.GenerativeModel(model_name)
+        
+        # Read audio bytes
+        audio_bytes = audio_file.read()
+        
+        # Gemini expects a specific structure for blob parts
+        # Note: We are mocking the proper PyAudio upload structure for simplicity.
+        # Ideally, we upload to File API, but for small clips, we can sometimes send bytes if supported.
+        # If byte-upload fails in your specific library version, we use a text fallback.
+        
+        prompt = f"""
+        Please transcribe this audio file exactly as spoken in {selected_language}. 
+        Do not add any conversational filler. Just return the text.
+        """
+        
+        # NOTE: Direct byte processing depends on library version. 
+        # Standard robust way is using the File API, but here we attempt a direct generate content
+        # with the audio mime type.
+        response = model.generate_content([
+            prompt,
+            {"mime_type": "audio/wav", "data": audio_bytes}
+        ])
+        return response.text.strip()
+    except Exception as e:
+        return f"Transcription Error: {str(e)}"
 
 # --- RAG ENGINE (MEMORY) ---
 def get_embedding(text: str, api_key: str) -> np.ndarray:
@@ -144,10 +161,8 @@ def store_interaction(user_text: str, ai_text: str, api_key: str):
 
 @st.cache_data(ttl=3600)
 def get_clinical_trials(query: str, status: str = "RECRUITING") -> Dict:
-    # Adding "treatment" to query helps find process-related studies
     if "treatment" not in query.lower():
         query += " treatment"
-        
     base_url = "https://clinicaltrials.gov/api/v2/studies"
     params = {"query.term": query, "filter.overallStatus": status, "pageSize": 5}
     try:
@@ -157,14 +172,8 @@ def get_clinical_trials(query: str, status: str = "RECRUITING") -> Dict:
         return {"error": str(e)}
 
 def format_trials(trials_data: Dict, include_links: bool) -> str:
-    """
-    Formats trials differently based on Persona.
-    include_links=True (Doctors) -> Shows IDs and Links
-    include_links=False (Patients) -> Hides technical IDs, focuses on Title/Desc
-    """
     studies = trials_data.get("studies", [])
     if not studies: return "No specific clinical trials found. (Answer based on general medical knowledge)."
-    
     text = ""
     for s in studies:
         p = s.get("protocolSection", {})
@@ -173,31 +182,21 @@ def format_trials(trials_data: Dict, include_links: bool) -> str:
         title = id_mod.get('briefTitle', 'No Title')
         
         if include_links:
-            # DOCTOR FORMAT: Technical, Linked
             link = f"[{nct_id}](https://clinicaltrials.gov/study/{nct_id})"
             text += f"ID: {link} | Title: {title}\n"
-            
-            # Add detailed eligibility
             eligibility = p.get("eligibilityModule", {})
             criteria = eligibility.get("eligibilityCriteria", "")[:200] + "..."
             text += f"   Criteria Snippet: {criteria}\n"
         else:
-            # PATIENT FORMAT: Narrative, No IDs
             text += f"• Potential Treatment Option: {title}\n"
-            
-            # Simplify eligibility for patient context
             eligibility = p.get("eligibilityModule", {})
             min_age = eligibility.get("minimumAge", "N/A")
             max_age = eligibility.get("maximumAge", "N/A")
             text += f"   (Available for ages {min_age} to {max_age})\n"
-            
         text += "\n"
-        
     return text
 
 def generate_response_multilingual(query, context, persona, language, memory, api_key):
-    # DYNAMIC PROMPTING
-    
     if "Doctor" in persona:
         role_desc = "Expert Clinical Research Associate."
         tone = "Professional, precise, technical."
@@ -235,7 +234,7 @@ def generate_response_multilingual(query, context, persona, language, memory, ap
 
 st.header(f"🧬 MediTrial AI ({selected_language})")
 
-# 1. Multimodal Input
+# 1. Multimodal Input (Image)
 with st.expander("📸 Upload Report / Scan", expanded=False):
     uploaded_file = st.file_uploader("Upload Medical Record", type=["jpg", "png"])
     if uploaded_file and api_key:
@@ -255,43 +254,58 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # 3. Logic Loop
-if prompt := st.chat_input(f"Ask about treatments in {selected_language}..."):
+# --- KEY CHANGE: accept_audio=True places the mic icon INSIDE the input box ---
+prompt_data = st.chat_input(f"Ask about treatments in {selected_language}...", accept_audio=True)
+
+if prompt_data:
     if not api_key:
         st.error("🔑 API Key required!")
         st.stop()
+        
+    # prompt_data is now a Dict: {'text': "...", 'audio': UploadedFile}
+    user_text = prompt_data["text"]
+    audio_file = prompt_data["audio"]
+    
+    # Logic: Prioritize audio if present, otherwise use text
+    final_prompt = user_text
+    
+    if audio_file:
+        with st.spinner("🎧 Transcribing your voice..."):
+            transcription = transcribe_audio_with_gemini(audio_file, api_key)
+            if "Error" not in transcription:
+                final_prompt = transcription
+                st.info(f"🗣️ You said: {final_prompt}")
+            else:
+                st.error(transcription)
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # Proceed only if we have a valid prompt (either text or transcribed audio)
+    if final_prompt:
+        st.session_state.messages.append({"role": "user", "content": final_prompt})
+        with st.chat_message("user"):
+            st.markdown(final_prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("🧠 Analyzing treatment options..."):
-            
-            # 1. Memory
-            relevant_memory = retrieve_relevant_history(prompt, api_key)
-            
-            # 2. Search Logic
-            search_query = prompt
-            if "image" in prompt.lower() and st.session_state.image_analysis_context:
-                search_query = st.session_state.image_analysis_context[:50] # Use start of analysis as query
+        with st.chat_message("assistant"):
+            with st.spinner("🧠 Analyzing treatment options..."):
+                
+                relevant_memory = retrieve_relevant_history(final_prompt, api_key)
+                
+                search_query = final_prompt
+                if "image" in final_prompt.lower() and st.session_state.image_analysis_context:
+                    search_query = st.session_state.image_analysis_context[:50]
 
-            # 3. Fetch & Format Data
-            trials = get_clinical_trials(search_query)
-            
-            # CRITICAL: Pass persona to formatter to strip links for patients
-            include_links_flag = True if "Doctor" in user_persona else False
-            context_data = format_trials(trials, include_links=include_links_flag)
-            
-            # 4. Generate Response
-            response = generate_response_multilingual(
-                prompt, 
-                context_data, 
-                user_persona, 
-                selected_language, 
-                relevant_memory, 
-                api_key
-            )
-            
-            st.markdown(response)
-            store_interaction(prompt, response, api_key)
-            st.session_state.messages.append({"role": "assistant", "content": response})
+                trials = get_clinical_trials(search_query)
+                include_links_flag = True if "Doctor" in user_persona else False
+                context_data = format_trials(trials, include_links=include_links_flag)
+                
+                response = generate_response_multilingual(
+                    final_prompt, 
+                    context_data, 
+                    user_persona, 
+                    selected_language, 
+                    relevant_memory, 
+                    api_key
+                )
+                
+                st.markdown(response)
+                store_interaction(final_prompt, response, api_key)
+                st.session_state.messages.append({"role": "assistant", "content": response})
